@@ -14,7 +14,9 @@ export default function Tester() {
   const cfg = KINDS[kind];
   const [pack, setPack] = useState('');
   const [tag, setTag] = useState('');
+  const [limit, setLimit] = useState('30');
   const [related, setRelated] = useState(true);
+  const [offset, setOffset] = useState(0);
 
   const [packs, setPacks] = useState([]);
   const [tags, setTags] = useState([]);
@@ -22,18 +24,24 @@ export default function Tester() {
   const [loading, setLoading] = useState(false);
   const [copied, setCopied] = useState('');
 
-  const buildUrl = () => {
+  // Limit is always a whole number from 1 to 100 (blank/0 means the default, 30)
+  const limitNum = Math.min(Math.max(parseInt(limit, 10) || 30, 1), 100);
+
+  const buildUrl = (off) => {
     const p = new URLSearchParams();
     if (pack.trim()) p.set('pack', pack.trim());
     if (tag.trim()) p.set('tag', tag.trim());
     if (!related) p.set('related', '0');
+    p.set('limit', String(limitNum));
+    if (off) p.set('offset', String(off));
     return `${API}${cfg.list}?${p}`;
   };
-  const url = buildUrl();
+  const url = buildUrl(offset);
 
-  const run = async () => {
+  const run = async (nextOffset = 0) => {
+    setOffset(nextOffset);
     setLoading(true);
-    const target = buildUrl();
+    const target = buildUrl(nextOffset);
     const t0 = performance.now();
     try {
       const r = await fetch(target, { cache: 'no-store' });
@@ -57,7 +65,7 @@ export default function Tester() {
   }, [cfg]);
 
   const latest = useRef({});
-  latest.current = { run, hasResult: !!res };
+  latest.current = { run, offset, hasResult: !!res };
 
   useEffect(() => {
     loadLists();
@@ -65,7 +73,7 @@ export default function Tester() {
     let ch;
     try {
       ch = new BroadcastChannel('sticker-studio');
-      ch.onmessage = () => { loadLists(); const l = latest.current; if (l.hasResult) l.run(); };
+      ch.onmessage = () => { loadLists(); const l = latest.current; if (l.hasResult) l.run(l.offset); };
     } catch {}
     window.addEventListener('focus', refresh);
     document.addEventListener('visibilitychange', refresh);
@@ -88,7 +96,7 @@ export default function Tester() {
   // Switching API clears the filters and the old result
   const switchKind = (k) => {
     if (k === kind) return;
-    setKind(k); setPack(''); setTag(''); setRes(null); setPacks([]); setTags([]);
+    setKind(k); setPack(''); setTag(''); setOffset(0); setRes(null); setPacks([]); setTags([]);
   };
 
   return (
@@ -109,22 +117,30 @@ export default function Tester() {
         ))}
       </div>
 
-      <form className="card" onSubmit={(e) => { e.preventDefault(); run(); }}>
+      <form className="card" onSubmit={(e) => { e.preventDefault(); run(0); }}>
         <div className="row">
             <div className="field">
               <label htmlFor="pack">Pack name</label>
-              <input id="pack" type="text" list="packs" placeholder={`e.g. ${cfg.ex}`} value={pack} onChange={(e) => { setPack(e.target.value); }} />
+              <input id="pack" type="text" list="packs" placeholder={`e.g. ${cfg.ex}`} value={pack} onChange={(e) => { setPack(e.target.value); setOffset(0); }} />
               <datalist id="packs">{packs.map((p) => <option key={p.id} value={p.name}>{p.count} {noun}s</option>)}</datalist>
             </div>
           <div className="field">
             <label htmlFor="tag">Tag</label>
-            <input id="tag" type="text" list="tags" placeholder="e.g. happy" value={tag} onChange={(e) => { setTag(e.target.value); }} />
+            <input id="tag" type="text" list="tags" placeholder="e.g. happy" value={tag} onChange={(e) => { setTag(e.target.value); setOffset(0); }} />
             <datalist id="tags">{tags.map((t) => <option key={t.tag} value={t.tag} />)}</datalist>
+          </div>
+          <div className="field" style={{ maxWidth: 130, minWidth: 110 }}>
+            <label htmlFor="limit">Limit (1–100)</label>
+            <input
+              id="limit" type="text" inputMode="numeric" value={limit}
+              onChange={(e) => { setLimit(e.target.value.replace(/\D/g, '').slice(0, 3)); setOffset(0); }}
+              onBlur={() => setLimit(String(limitNum))}
+            />
           </div>
         </div>
         <div className="row" style={{ marginTop: 12 }}>
           <label className="row" style={{ gap: 6 }}>
-            <input type="checkbox" checked={related} onChange={(e) => { setRelated(e.target.checked); }} /> Include related {noun}s
+            <input type="checkbox" checked={related} onChange={(e) => { setRelated(e.target.checked); setOffset(0); }} /> Include related {noun}s
           </label>
           <button className="btn pri" disabled={loading}>{loading ? 'Loading…' : 'Run request'}</button>
           <span className="muted">{packs.length} packs · {tags.length} tags</span>
@@ -149,7 +165,8 @@ export default function Tester() {
             <h2>
               {res.status !== 200 ? `Error ${res.status}`
                 : json.total === 1 ? `1 ${noun}`
-                : `${json.total} ${noun}s`}
+                : json.data.length === 0 || json.data.length === json.total ? `${json.total} ${noun}s`
+                : `Showing ${json.offset + 1}–${json.offset + json.data.length} of ${json.total} ${noun}s`}
               {res.status === 200 && json.matched !== json.total && <span className="muted"> · {json.matched} direct, {json.total - json.matched} related</span>}
             </h2>
             <span className="muted">HTTP {res.status} · {res.ms} ms</span>
@@ -169,6 +186,14 @@ export default function Tester() {
                   <small>{s.tags.join(', ') || 'no tags'}</small>
                 </div>
               ))}
+            </div>
+          )}
+
+          {res.status === 200 && json.total > json.limit && (
+            <div className="row" style={{ marginTop: 14 }}>
+              <button className="btn" disabled={json.offset === 0 || loading} onClick={() => run(Math.max(0, json.offset - json.limit))}>← Previous</button>
+              <span className="muted">Page {Math.floor(json.offset / json.limit) + 1} of {Math.ceil(json.total / json.limit)}</span>
+              <button className="btn" disabled={json.offset + json.limit >= json.total || loading} onClick={() => run(json.offset + json.limit)}>Next →</button>
             </div>
           )}
 
