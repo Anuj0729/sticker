@@ -208,12 +208,10 @@ const shape = (s, match, kind) => ({ ...sticker(s, kind), pack: { id: s.pack_id,
 //   ?pack=Cats            -> every item of pack "Cats" (name or id)
 //   ?tag=happy            -> items tagged "happy" + related ones
 //   ?pack=Cats&tag=happy  -> filters combine
-//   &related=0 (no related), &limit=30&offset=0 (limit: 1-100)
+//   &related=0 (no related). Always returns every match (no limit / pagination).
 const listHandler = (kind) => (req, res) => {
   const pack = norm(req.query.pack);
   const tagTerms = String(req.query.tag || '').split(',').map(norm).filter(Boolean);
-  const limit = Math.min(Math.max(Math.floor(+req.query.limit) || 30, 1), 100);
-  const offset = Math.max(Math.floor(+req.query.offset) || 0, 0);
   const wantRelated = !['0', 'false'].includes(String(req.query.related));
 
   let rows = publishedItems(kind);
@@ -251,7 +249,7 @@ const listHandler = (kind) => (req, res) => {
     data = [...direct.map((s) => shape(s, 'tag', kind)), ...related.map((s) => shape(s, 'related', kind))];
   }
 
-  res.json({ total: data.length, matched, limit, offset, data: data.slice(offset, offset + limit) });
+  res.json({ total: data.length, matched, data });
 };
 
 // Helpers for building UIs (pack picker, tag suggestions)
