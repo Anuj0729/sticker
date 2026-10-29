@@ -105,11 +105,23 @@ function Packs({ kind, token, onLogout }) {
   }, [token, kind, onLogout]);
   useEffect(() => { load(); }, [load]);
 
-  const act = async (fn) => { setErr(''); try { await fn(); notify(); await load(); } catch (e) { setErr(e.message); } };
+  // Runs a request and tells other tabs. The screen is updated locally (no full reload), so it feels instant.
+  // If a request fails we reload from the server to get back to the true state.
+  const act = async (fn) => {
+    setErr('');
+    try { await fn(); notify(); }
+    catch (e) { setErr(e.message); load(); }
+  };
+  const patchPack = (id, fn) => setPacks((ps) => ps && ps.map((p) => (p.id === id ? fn(p) : p)));
 
   const create = (e) => {
     e.preventDefault();
-    act(async () => { await call('/admin/packs', { token, method: 'POST', body: { name, author, kind } }); setName(''); setAuthor(''); });
+    if (!name.trim()) return setErr('Pack name is required');
+    act(async () => {
+      const pack = await call('/admin/packs', { token, method: 'POST', body: { name, author, kind } });
+      setPacks((ps) => [pack, ...(ps || [])]);
+      setName(''); setAuthor('');
+    });
   };
 
   return (
@@ -126,12 +138,12 @@ function Packs({ kind, token, onLogout }) {
 
       {packs === null && <p className="muted">Loading packs…</p>}
       {packs?.length === 0 && <p className="muted">No {cfg.noun} packs yet. Create one above, then add {cfg.noun}s to it.</p>}
-      {packs?.map((p) => <PackCard key={p.id} pack={p} kind={kind} token={token} act={act} />)}
+      {packs?.map((p) => <PackCard key={p.id} pack={p} kind={kind} token={token} act={act} patchPack={patchPack} removePack={(id) => setPacks((ps) => ps.filter((x) => x.id !== id))} />)}
     </>
   );
 }
 
-function PackCard({ pack, kind, token, act }) {
+function PackCard({ pack, kind, token, act, patchPack, removePack }) {
   const cfg = KINDS[kind];
   const isGif = kind === 'gif';
   const BIG = cfg.maxMb * 1024 * 1024;
@@ -139,7 +151,6 @@ function PackCard({ pack, kind, token, act }) {
   const [items, setItems] = useState([]);
   const [tags, setTags] = useState(''); // tags applied to every image
   const [busy, setBusy] = useState(false);
-  const [removeBg, setRemoveBg] = useState(true);
   const [note, setNote] = useState('');
 
   // Free the local preview URLs when this card goes away
@@ -147,12 +158,26 @@ function PackCard({ pack, kind, token, act }) {
   itemsRef.current = items;
   useEffect(() => () => itemsRef.current.forEach((i) => URL.revokeObjectURL(i.src)), []);
 
+  const [renaming, setRenaming] = useState(false);
+  const [rName, setRName] = useState('');
+  const [rAuthor, setRAuthor] = useState('');
+  const startRename = () => { setRName(pack.name); setRAuthor(pack.author || ''); setRenaming(true); };
+  const saveRename = (e) => {
+    e.preventDefault();
+    const name = rName.trim(), author = rAuthor.trim();
+    if (!name) return;
+    patchPack(pack.id, (p) => ({ ...p, name, author }));
+    setRenaming(false);
+    act(() => call(`/admin/packs/${pack.id}`, { token, method: 'PATCH', body: { name, author } }));
+  };
+
   const tooBig = items.some((i) => i.file.size > BIG);
 
   const pick = (e) => {
     const picked = [...e.target.files].filter((f) => !isGif || f.type === 'image/gif').slice(0, Math.max(0, cfg.maxFiles - items.length));
     e.target.value = ''; // lets you pick the same file again later
-    const added = picked.map((file) => ({ id: Math.random().toString(36).slice(2), file, src: URL.createObjectURL(file), tags: '' }));
+    // Tag defaults to the file name (without extension); you can edit it before uploading
+    const added = picked.map((file) => ({ id: Math.random().toString(36).slice(2), file, src: URL.createObjectURL(file), tags: file.name.replace(/\.[^.]+$/, '').replace(/,/g, ' ').trim() }));
     setItems((prev) => [...prev, ...added]);
   };
   const setItemTags = (id, v) => setItems((prev) => prev.map((i) => (i.id === id ? { ...i, tags: v } : i)));
@@ -169,9 +194,9 @@ function PackCard({ pack, kind, token, act }) {
       items.forEach((i) => form.append('files', i.file));
       form.append('tags', tags); // for all images
       form.append('fileTags', JSON.stringify(items.map((i) => i.tags))); // one entry per image, same order
-      if (!isGif) form.append('removeBg', removeBg ? '1' : '0'); // GIFs keep their background
       const r = await call(`/admin/packs/${pack.id}/stickers`, { token, method: 'POST', form });
-      setNote(r.warnings?.length ? `Uploaded. ${r.warnings.join(' · ')}` : '');
+      patchPack(pack.id, (p) => ({ ...p, stickers: [...p.stickers, ...r.added] }));
+      setNote('');
       clearAll(); setTags('');
     } finally { setBusy(false); }
   });
@@ -179,18 +204,40 @@ function PackCard({ pack, kind, token, act }) {
   return (
     <div className="card">
       <div className="row" style={{ justifyContent: 'space-between' }}>
-        <div>
-          <h2>{pack.name}</h2>
-          <span className="muted">{pack.author || 'No author'} · {pack.stickers.length} {cfg.noun}s · ID {pack.id}</span>
-        </div>
-        <div className="row">
-          <button className="btn" onClick={() => act(() => call(`/admin/packs/${pack.id}`, { token, method: 'PATCH', body: { published: !pack.published } }))}>
-            {pack.published ? 'Unpublish' : 'Publish'}
-          </button>
-          <button className="btn del" onClick={() => confirm(`Delete "${pack.name}" and all its ${cfg.noun}s?`) && act(() => call(`/admin/packs/${pack.id}`, { token, method: 'DELETE' }))}>
-            Delete pack
-          </button>
-        </div>
+        {renaming ? (
+          <form className="row" style={{ flex: 1 }} onSubmit={saveRename}>
+            <input type="text" autoFocus aria-label="Pack name" placeholder="Pack name" value={rName}
+              onChange={(e) => setRName(e.target.value)} onKeyDown={(e) => e.key === 'Escape' && setRenaming(false)} />
+            <input type="text" aria-label="Author" placeholder="Author (optional)" value={rAuthor}
+              onChange={(e) => setRAuthor(e.target.value)} onKeyDown={(e) => e.key === 'Escape' && setRenaming(false)} />
+            <button className="btn pri" disabled={!rName.trim()}>Save</button>
+            <button type="button" className="btn" onClick={() => setRenaming(false)}>Cancel</button>
+          </form>
+        ) : (
+          <>
+            <div>
+              <h2>{pack.name}</h2>
+              <span className="muted">{pack.author || 'No author'} · {pack.stickers.length} {cfg.noun}s · ID {pack.id}</span>
+            </div>
+            <div className="row">
+              <button className="btn" onClick={startRename}>Edit name</button>
+              <button className="btn" onClick={() => {
+                const published = !pack.published;
+                patchPack(pack.id, (p) => ({ ...p, published }));
+                act(() => call(`/admin/packs/${pack.id}`, { token, method: 'PATCH', body: { published } }));
+              }}>
+                {pack.published ? 'Unpublish' : 'Publish'}
+              </button>
+              <button className="btn del" onClick={() => {
+                if (!confirm(`Delete "${pack.name}" and all its ${cfg.noun}s?`)) return;
+                removePack(pack.id);
+                act(() => call(`/admin/packs/${pack.id}`, { token, method: 'DELETE' }));
+              }}>
+                Delete pack
+              </button>
+            </div>
+          </>
+        )}
       </div>
 
       <div className="row" style={{ marginTop: 14 }}>
@@ -204,7 +251,7 @@ function PackCard({ pack, kind, token, act }) {
             <button className="btn" onClick={clearAll}>Clear</button>
           </div>
           <p className="muted" style={{ margin: '6px 0 0' }}>
-            Type tags under each image. They are added to the tags for all images{tags ? ` (${tags})` : ''}.
+            Each image's tag is its file name by default - edit it if you want. It is added to the tags for all images{tags ? ` (${tags})` : ''}.
           </p>
           <div className="grid">
             {items.map((i) => (
@@ -216,7 +263,7 @@ function PackCard({ pack, kind, token, act }) {
                 </small>
                 <div className="tagedit">
                   <input
-                    type="text" aria-label={`Tags for ${i.file.name}`} placeholder="tags for this image"
+                    type="text" aria-label={`Tags for ${i.file.name}`} placeholder="tags (default: file name)"
                     value={i.tags} onChange={(e) => setItemTags(i.id, e.target.value)}
                   />
                 </div>
@@ -225,14 +272,8 @@ function PackCard({ pack, kind, token, act }) {
             ))}
           </div>
           <div className="row" style={{ marginTop: 12 }}>
-            {!isGif && (
-              <label className="row" style={{ gap: 6 }}>
-                <input type="checkbox" checked={removeBg} onChange={(e) => setRemoveBg(e.target.checked)} disabled={busy} />
-                Remove background
-              </label>
-            )}
             <button className="btn pri" disabled={busy || tooBig} onClick={upload}>
-              {busy ? (!isGif && removeBg ? 'Removing backgrounds & uploading…' : 'Uploading…') : `Upload ${items.length} ${cfg.noun}${items.length > 1 ? 's' : ''}`}
+              {busy ? 'Uploading…' : `Upload ${items.length} ${cfg.noun}${items.length > 1 ? 's' : ''}`}
             </button>
             {tooBig && <span className="err" style={{ margin: 0 }}>Remove files above {cfg.maxMb} MB first.</span>}
           </div>
@@ -245,22 +286,25 @@ function PackCard({ pack, kind, token, act }) {
         <p className="muted">This pack is empty. Pick up to {cfg.maxFiles} {isGif ? 'GIF files' : 'images'}, check the preview, then upload.</p>
       ) : (
         <div className="grid">
-          {pack.stickers.map((s) => <StickerTile key={s.id} s={s} noun={cfg.noun} token={token} act={act} />)}
+          {pack.stickers.map((s) => <StickerTile key={s.id} s={s} noun={cfg.noun} token={token} act={act}
+            onTags={(tags) => patchPack(pack.id, (p) => ({ ...p, stickers: p.stickers.map((x) => (x.id === s.id ? { ...x, tags } : x)) }))}
+            onRemove={() => patchPack(pack.id, (p) => ({ ...p, stickers: p.stickers.filter((x) => x.id !== s.id) }))} />)}
         </div>
       )}
     </div>
   );
 }
 
-function StickerTile({ s, noun, token, act }) {
+function StickerTile({ s, noun, token, act, onTags, onRemove }) {
   const [editing, setEditing] = useState(false);
   const [val, setVal] = useState('');
 
   const start = () => { setVal(s.tags.join(', ')); setEditing(true); };
-  const save = () => act(async () => {
-    await call(`/admin/stickers/${s.id}`, { token, method: 'PATCH', body: { tags: val } });
+  const save = () => {
+    onTags(val.split(',').map((t) => t.trim().toLowerCase()).filter(Boolean));
     setEditing(false);
-  });
+    act(() => call(`/admin/stickers/${s.id}`, { token, method: 'PATCH', body: { tags: val } }));
+  };
 
   return (
     <div className="st">
@@ -282,7 +326,7 @@ function StickerTile({ s, noun, token, act }) {
           {s.tags.join(', ') || 'add tags'} ✎
         </button>
       )}
-      <button className="x" aria-label={`Delete ${noun}`} onClick={() => act(() => call(`/admin/stickers/${s.id}`, { token, method: 'DELETE' }))}>×</button>
+      <button className="x" aria-label={`Delete ${noun}`} onClick={() => { onRemove(); act(() => call(`/admin/stickers/${s.id}`, { token, method: 'DELETE' })); }}>×</button>
     </div>
   );
 }

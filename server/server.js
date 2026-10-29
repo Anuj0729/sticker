@@ -7,7 +7,6 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const path = require('path');
 const { ensureConfigured, uploadBuffer, deleteByUrl, deliveryUrl } = require('./config/cloudinary');
-const bg = require('./config/bgRemoval');
 
 const { PORT = 4000, ADMIN_PASSWORD, JWT_SECRET, ADMIN_ORIGIN = 'http://localhost:3000', USAGE_KEY = '' } = process.env;
 if (!ADMIN_PASSWORD || !JWT_SECRET) throw new Error('Set ADMIN_PASSWORD and JWT_SECRET in .env');
@@ -49,6 +48,7 @@ if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='gifs'")
   db.exec('DROP TABLE gifs');
 }
 
+const UPLOAD_CONCURRENCY = 6;
 const gifFit = (u) => u.replace('/upload/', '/upload/w_480,c_limit,q_auto/'); // lighter GIF, max 480px wide
 const mediaUrl = (file, kind) => (kind === 'gif' ? gifFit(file) : deliveryUrl(file)); // `file` holds the Cloudinary secure_url
 const sticker = (s, kind = 'sticker') => ({
@@ -103,20 +103,26 @@ app.post('/admin/packs', adminOnly, (req, res) => {
   const { name, author = '' } = req.body;
   if (!name?.trim()) return res.status(400).json({ error: 'Pack name is required' });
   const r = db.prepare('INSERT INTO packs (name, author, kind) VALUES (?,?,?)').run(name.trim(), author.trim(), kindOf(req.body.kind));
-  res.status(201).json({ id: r.lastInsertRowid });
+  const pack = db.prepare('SELECT * FROM packs WHERE id=?').get(r.lastInsertRowid);
+  res.status(201).json({ ...pack, published: !!pack.published, stickers: [] });
 });
 
 app.patch('/admin/packs/:id', adminOnly, (req, res) => {
   const { name, author, published } = req.body;
-  db.prepare('UPDATE packs SET name=COALESCE(?,name), author=COALESCE(?,author), published=COALESCE(?,published) WHERE id=?')
-    .run(name ?? null, author ?? null, published === undefined ? null : +!!published, req.params.id);
+  if (name !== undefined && !String(name).trim()) return res.status(400).json({ error: 'Pack name cannot be empty' });
+  const r = db.prepare('UPDATE packs SET name=COALESCE(?,name), author=COALESCE(?,author), published=COALESCE(?,published) WHERE id=?')
+    .run(name === undefined ? null : String(name).trim(), author === undefined ? null : String(author).trim(),
+      published === undefined ? null : +!!published, req.params.id);
+  if (!r.changes) return res.status(404).json({ error: 'Pack not found' });
   res.json({ ok: true });
 });
 
-app.delete('/admin/packs/:id', adminOnly, async (req, res) => {
-  await Promise.all(db.prepare('SELECT file FROM stickers WHERE pack_id=?').all(req.params.id).map((s) => deleteByUrl(s.file)));
+// Delete: the database is the source of truth, so answer right away and clean Cloudinary in the background.
+app.delete('/admin/packs/:id', adminOnly, (req, res) => {
+  const files = db.prepare('SELECT file FROM stickers WHERE pack_id=?').all(req.params.id);
   db.prepare('DELETE FROM packs WHERE id=?').run(req.params.id);
   res.json({ ok: true });
+  files.forEach((s) => deleteByUrl(s.file)); // never throws
 });
 
 // ---------- Admin: items inside a pack (stickers or GIFs, decided by the pack) ----------
@@ -140,29 +146,32 @@ app.post('/admin/packs/:id/stickers', adminOnly, pickUploader, async (req, res, 
     try { perFile = JSON.parse(req.body.fileTags || '[]'); } catch {}
     // tags for all images + extra tags for each image, de-duplicated
     const tagsFor = (i) => [...new Set(cleanTags(`${commonTags || ''},${perFile[i] || ''}`).split(',').filter(Boolean))].join(',');
-    const wantBg = !isGif && bg.enabled() && req.body.removeBg !== '0'; // admin checkbox, on by default
-    const warnings = [];
-    const added = [];
+    // Upload all files to Cloudinary in parallel (a few at a time), then insert in the original order.
+    const results = new Array(req.files.length);
+    let next = 0;
+    const worker = async () => {
+      while (next < req.files.length) {
+        const i = next++;
+        const f = req.files[i];
+        results[i] = await uploadBuffer(`${pack.id}/${crypto.randomUUID()}`, f.buffer);
+      }
+    };
+    try {
+      await Promise.all(Array.from({ length: Math.min(UPLOAD_CONCURRENCY, req.files.length) }, worker));
+    } catch (e) {
+      results.forEach((r) => r && deleteByUrl(r.secure_url)); // don't leave orphans behind
+      throw e;
+    }
 
-    for (const [i, f] of req.files.entries()) {
+    const insert = db.prepare('INSERT INTO stickers (pack_id,file,tags,animated) VALUES (?,?,?,?)');
+    const added = req.files.map((f, i) => {
       const tags = tagsFor(i);
       const animated = isGif || f.mimetype === 'image/gif' ? 1 : 0;
-      let buffer = f.buffer;
-      if (wantBg && animated) {
-        warnings.push(`${f.originalname}: GIFs keep their background`);
-      } else if (wantBg) {
-        try { buffer = await bg.removeBg(f.buffer); }
-        catch (e) {
-          console.error('Background removal failed:', e);
-          warnings.push(`${f.originalname}: background could not be removed, uploaded as is`);
-        }
-      }
-      const up = await uploadBuffer(`${pack.id}/${crypto.randomUUID()}`, buffer);
-      const file = up.secure_url;
-      const r = db.prepare('INSERT INTO stickers (pack_id,file,tags,animated) VALUES (?,?,?,?)').run(pack.id, file, tags, animated);
-      added.push(sticker({ id: r.lastInsertRowid, pack_id: pack.id, file, tags, animated }, pack.kind));
-    }
-    res.status(201).json({ added, warnings });
+      const file = results[i].secure_url;
+      const r = insert.run(pack.id, file, tags, animated);
+      return sticker({ id: Number(r.lastInsertRowid), pack_id: pack.id, file, tags, animated }, pack.kind);
+    });
+    res.status(201).json({ added });
   } catch (e) { next(e); }
 });
 
@@ -171,11 +180,11 @@ app.patch('/admin/stickers/:id', adminOnly, (req, res) => {
   res.json({ ok: true });
 });
 
-app.delete('/admin/stickers/:id', adminOnly, async (req, res) => {
+app.delete('/admin/stickers/:id', adminOnly, (req, res) => {
   const s = db.prepare('SELECT file FROM stickers WHERE id=?').get(req.params.id);
-  if (s) await deleteByUrl(s.file);
   db.prepare('DELETE FROM stickers WHERE id=?').run(req.params.id);
   res.json({ ok: true });
+  if (s) deleteByUrl(s.file); // background cleanup
 });
 
 // ---------- Public API (no key needed) ----------
