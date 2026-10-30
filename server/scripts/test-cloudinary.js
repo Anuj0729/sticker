@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { cloudinary, ensureConfigured } = require('./config/cloudinary');
+const { cloudinary, ensureConfigured } = require('../src/config/cloudinary');
 
 ensureConfigured();
 cloudinary.api.ping()
