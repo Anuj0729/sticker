@@ -88,10 +88,27 @@ const listHandler = (fixed) => (req, res) => {
     }
     res.locals.search = searched;
   }
-  res.json({ total: data.length, matched, limit, offset, data: data.slice(offset, offset + limit) });
+
+  const pl = Number.isFinite(+req.query.popular_limit) && req.query.popular_limit !== undefined && req.query.popular_limit !== ''
+    ? Math.min(Math.max(Math.floor(+req.query.popular_limit), 0), 30) : 10;
+  const usesOf = new Map(rows.map((s) => [s.id, s.use_count || 0]));
+  const popularAll = data
+    .filter((d) => d.match !== 'related' && usesOf.get(d.id) > 0)
+    .sort((a, b) => usesOf.get(b.id) - usesOf.get(a.id))
+    .slice(0, pl)
+    .map((d) => ({ ...d, uses: usesOf.get(d.id) }));
+  const popIds = new Set(popularAll.map((d) => d.id));
+  const recentAll = data.filter((d) => !popIds.has(d.id));
+
+  res.json({
+    total: data.length, matched, limit, offset,
+    ...(offset === 0 && popularAll.length > 0 && { popular: popularAll }),
+    recent: recentAll.slice(offset, offset + limit),
+    recentTotal: recentAll.length,
+    data: data.slice(offset, offset + limit),
+  });
 };
 
-// Helpers for building UIs (pack picker, tag suggestions)
 const packsHandler = (fixed) => (req, res) => {
   const { ok, kind } = resolveKind(fixed, req, res);
   if (!ok) return;
@@ -113,8 +130,6 @@ const tagsHandler = (fixed) => (req, res) => {
   res.json(Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([tag, count]) => ({ tag, count })));
 };
 
-// Most used items (all time), highest first. Only items that were used at least once appear.
-//   /api/stickers/popular?limit=12   and   /api/gifs/popular
 const popularHandler = (fixed) => (req, res) => {
   const { ok, kind } = resolveKind(fixed, req, res);
   if (!ok) return;
@@ -127,8 +142,6 @@ const popularHandler = (fixed) => (req, res) => {
   res.json({ total: rows.length, limit, data: rows.map((s) => ({ ...shape(s, 'popular'), uses: s.use_count })) });
 };
 
-// Count one use (called by the chat backend after a message with this item was sent).
-// Protected by USAGE_KEY when it is set in .env.
 const useHandler = (fixed) => (req, res) => {
   const { ok, kind } = resolveKind(fixed, req, res);
   if (!ok) return;

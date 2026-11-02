@@ -194,25 +194,44 @@ export default function ApiTester() {
           {json.error && <p className="err">{json.error}</p>}
           {res.status === 200 && json.data.length === 0 && <p className="muted">Nothing matched. Try a different pack or tag, or clear a filter.</p>}
 
-          {json.data?.length > 0 && (
-            <div className="grid">
-              {json.data.map((s) => (
-                <div className="st" key={s.id}>
-                  {s.match === 'tag' && <span className="badge">match</span>}
-                  {s.match === 'related' && <span className="badge rel">related</span>}
-                  <img src={s.url} alt={s.tags.join(' ') || noun} loading="lazy" />
-                  <small>{s.original ? 'GIF' : 'Sticker'} · {s.pack.name}</small>
-                  <small>{s.tags.join(', ') || 'no tags'}</small>
-                </div>
-              ))}
-            </div>
+          {res.status === 200 && json.popular?.length > 0 && (
+            <>
+              <h3 style={{ margin: '14px 0 8px' }}>🔥 Popular <span className="muted">· most used</span></h3>
+              <div className="grid">
+                {json.popular.map((s) => (
+                  <div className="st" key={s.id}>
+                    <span className="badge">{s.uses} uses</span>
+                    <img src={s.url} alt={s.tags.join(' ') || noun} loading="lazy" />
+                    <small>{s.original ? 'GIF' : 'Sticker'} · {s.pack.name}</small>
+                    <small>{s.tags.join(', ') || 'no tags'}</small>
+                  </div>
+                ))}
+              </div>
+            </>
           )}
 
-          {res.status === 200 && json.total > json.limit && (
+          {res.status === 200 && json.recent?.length > 0 && (
+            <>
+              <h3 style={{ margin: '14px 0 8px' }}>🕒 Recent <span className="muted">· all others, newest first</span></h3>
+              <div className="grid">
+                {json.recent.map((s) => (
+                  <div className="st" key={s.id}>
+                    {s.match === 'tag' && <span className="badge">match</span>}
+                    {s.match === 'related' && <span className="badge rel">related</span>}
+                    <img src={s.url} alt={s.tags.join(' ') || noun} loading="lazy" />
+                    <small>{s.original ? 'GIF' : 'Sticker'} · {s.pack.name}</small>
+                    <small>{s.tags.join(', ') || 'no tags'}</small>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+
+          {res.status === 200 && (json.recentTotal ?? json.total) > json.limit && (
             <div className="row" style={{ marginTop: 14 }}>
               <button className="btn" disabled={json.offset === 0 || loading} onClick={() => run(Math.max(0, json.offset - json.limit))}>← Previous</button>
-              <span className="muted">Page {Math.floor(json.offset / json.limit) + 1} of {Math.ceil(json.total / json.limit)}</span>
-              <button className="btn" disabled={json.offset + json.limit >= json.total || loading} onClick={() => run(json.offset + json.limit)}>Next →</button>
+              <span className="muted">Page {Math.floor(json.offset / json.limit) + 1} of {Math.ceil((json.recentTotal ?? json.total) / json.limit)}</span>
+              <button className="btn" disabled={json.offset + json.limit >= (json.recentTotal ?? json.total) || loading} onClick={() => run(json.offset + json.limit)}>Next →</button>
             </div>
           )}
 
