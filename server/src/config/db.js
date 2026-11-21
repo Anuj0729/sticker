@@ -6,6 +6,9 @@ const { DB_PATH } = require('./env');
 // One table of packs and one of items. packs.kind = 'sticker' | 'gif' decides which API serves them.
 const db = new DatabaseSync(DB_PATH || path.join(__dirname, '..', '..', 'stickers.db'));
 db.exec('PRAGMA foreign_keys = ON');
+db.exec('PRAGMA journal_mode = WAL');   // readers don't block the writer: far fewer "database is locked" errors
+db.exec('PRAGMA busy_timeout = 5000');  // wait up to 5 s for a lock instead of failing at once
+db.exec('PRAGMA synchronous = NORMAL'); // safe with WAL, much faster per-request log writes
 db.exec(`
 CREATE TABLE IF NOT EXISTS packs (
   id INTEGER PRIMARY KEY, name TEXT NOT NULL, author TEXT DEFAULT '',
@@ -27,6 +30,18 @@ if (!db.prepare('PRAGMA table_info(packs)').all().some((c) => c.name === 'kind')
   if (!cols.includes('use_count')) db.exec('ALTER TABLE stickers ADD COLUMN use_count INTEGER DEFAULT 0');
   if (!cols.includes('last_used_at')) db.exec('ALTER TABLE stickers ADD COLUMN last_used_at TEXT');
 }
+db.exec('CREATE INDEX IF NOT EXISTS idx_stickers_pack ON stickers(pack_id)');
+
+// Per-user usage (like Gboard's "frequently used"): one row per user + sticker/GIF
+db.exec(`
+CREATE TABLE IF NOT EXISTS user_uses (
+  user_id TEXT NOT NULL,
+  item_id INTEGER NOT NULL REFERENCES stickers(id) ON DELETE CASCADE,
+  use_count INTEGER NOT NULL DEFAULT 0,
+  last_used_at TEXT,
+  PRIMARY KEY (user_id, item_id)
+);
+CREATE INDEX IF NOT EXISTS idx_user_uses_user ON user_uses(user_id, use_count DESC);`);
 // The earlier standalone `gifs` table is folded into a GIF pack (one time)
 if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='gifs'").get()) {
   const old = db.prepare('SELECT * FROM gifs').all();

@@ -26,6 +26,16 @@ const platformFromUA = (ua) => {
   return 'other';
 };
 
+// Paths of the real public routes (set by the router). Used to name the endpoint of calls that were
+// rejected before reaching a route (401 / 429), without letting random URLs flood the stats.
+let knownPaths = new Set();
+const endpointOf = (req, res) => {
+  if (req.route) return req.baseUrl + req.route.path;
+  if (res.statusCode === 404) return 'unmatched';
+  const p = String(req.originalUrl || '').split('?')[0].replace(/\/\d+(?=\/|$)/g, '/:id');
+  return knownPaths.has(p) ? p : 'unmatched';
+};
+
 const pad = (n) => String(n).padStart(2, '0');
 const sqlTime = (d = new Date()) =>
   `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
@@ -77,6 +87,7 @@ CREATE INDEX IF NOT EXISTS idx_item_uses_ts ON item_uses(ts);
 CREATE INDEX IF NOT EXISTS idx_item_uses_item ON item_uses(item_id);`);
 
   if (!db.prepare('PRAGMA table_info(api_logs)').all().some((c) => c.name === 'key_name')) db.exec('ALTER TABLE api_logs ADD COLUMN key_name TEXT');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_api_logs_key ON api_logs(key_name)'); // the API-keys list counts hits per key
 
   const insert = db.prepare(
     `INSERT INTO api_logs (ts,endpoint,method,type,source,platform,status,result_count,ms,client,params,ua,key_name)
@@ -95,7 +106,7 @@ CREATE INDEX IF NOT EXISTS idx_item_uses_item ON item_uses(item_id);`);
         const source = label(req.headers['x-source'] || q.source) || label(res.locals.keyName) || label(origin) || 'unknown'; // the API key's name is the fallback source
         const claimed = label(req.headers['x-platform'] || q.platform, 20);
         const platform = PLATFORMS.includes(claimed) ? claimed : claimed === 'desktop' ? 'web' : platformFromUA(ua);
-        const endpoint = req.route ? req.baseUrl + req.route.path : 'unmatched';
+        const endpoint = endpointOf(req, res);
         const params = Object.entries(q)
           .filter(([k]) => ['pack', 'tag', 'q', 'type', 'limit', 'offset', 'related'].includes(k))
           .map(([k, v]) => `${k}=${String(v).slice(0, 60)}`).join('&').slice(0, 200);
@@ -420,7 +431,7 @@ CREATE INDEX IF NOT EXISTS idx_item_uses_item ON item_uses(item_id);`);
     });
   }
 
-  return { logMiddleware, adminRoutes, analytics };
+  return { logMiddleware, adminRoutes, analytics, setKnownPaths: (paths) => { knownPaths = new Set(paths); } };
 }
 
 module.exports = { init, TESTER_SOURCE };

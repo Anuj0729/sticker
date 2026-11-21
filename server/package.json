@@ -2,6 +2,7 @@
   "name": "sticker-server",
   "version": "1.0.0",
   "main": "src/server.js",
+  "engines": { "node": ">=22.13" },
   "scripts": {
     "start": "node src/server.js",
     "test:cloudinary": "node scripts/test-cloudinary.js",

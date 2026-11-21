@@ -1,11 +1,12 @@
 const express = require('express');
 const { adminOnly } = require('../middleware/adminAuth');
 const { pickUploader } = require('../middleware/upload');
+const { loginGuard } = require('../middleware/rateLimit');
 const c = require('../controllers/admin.controller');
 
 const router = express.Router();
 
-router.post('/login', c.login);
+router.post('/login', loginGuard, c.login);
 
 // packs (?kind=sticker|gif)
 router.get('/packs', adminOnly, c.listPacks);
