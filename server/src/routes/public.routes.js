@@ -18,6 +18,7 @@ router.get('/media', c.listHandler());
 router.get('/media/packs', c.packsHandler());
 router.get('/media/tags', c.tagsHandler());
 router.get('/media/popular', c.popularHandler());
+router.get('/media/:id(\\d+)', c.itemHandler());
 router.post('/media/:id/use', c.useHandler());
 
 // Older per-kind endpoints (still working)

@@ -4,6 +4,17 @@ const { sticker, mediaUrl, norm } = require('../utils/media');
 const { hasUsageKey, verifyUserToken } = require('../utils/usageKey');
 const { publishedItems } = require('../utils/catalog'); // cached in memory, reloaded when the admin changes something
 
+// ---- Tunables (all optional, set in .env) ---------------------------------------------------------------
+// GLOBAL_MIN_USERS   : "global popular" is shown only once at least this many different users have reported usage.
+//                      Below that, global counts would basically expose 1-2 people's history. 0 = always allow.
+// POPULAR_DISCOVER_SLOTS : how many slots of /popular are given to the newest items nobody has used yet, so new
+//                      uploads get a chance and the same top items don't stay on top forever. 0 = off.
+// USE_COOLDOWN_MS    : the same user (or IP) reporting the same item again within this time is not counted twice.
+const intEnv = (v, d) => { const n = parseInt(v, 10); return Number.isFinite(n) && n >= 0 ? n : d; };
+const GLOBAL_MIN_USERS = intEnv(process.env.GLOBAL_MIN_USERS, 3);
+const DISCOVER_SLOTS = intEnv(process.env.POPULAR_DISCOVER_SLOTS, 2);
+const USE_COOLDOWN_MS = intEnv(process.env.USE_COOLDOWN_MS, 1500);
+
 // Same item shape as the live API: { id, packId, url, [original], tags, animated, pack, match } (no extra `type` field)
 const shape = (s, match) => ({ ...sticker(s, s.kind), pack: { id: s.pack_id, name: s.pack_name }, match });
 
@@ -21,6 +32,14 @@ const userIdOf = (req) => {
 };
 const userUsesMap = (uid) => new Map(db.prepare('SELECT item_id, use_count FROM user_uses WHERE user_id=?').all(uid).map((r) => [r.item_id, r.use_count]));
 const globalUsesMap = () => new Map(db.prepare('SELECT id, use_count FROM stickers WHERE use_count>0').all().map((r) => [r.id, r.use_count]));
+
+// Privacy gate for global popularity: with only 1-2 identified users, "global popular" is really their personal history.
+// If usage is reported without user ids at all (0 identified users) there is nothing personal in it, so it is allowed.
+const globalAllowed = () => {
+  if (!GLOBAL_MIN_USERS) return true;
+  const n = db.prepare('SELECT COUNT(DISTINCT user_id) AS n FROM user_uses').get().n;
+  return n === 0 || n >= GLOBAL_MIN_USERS;
+};
 
 // ?type=sticker|gif|all (also accepts stickers / gifs). No type = all. Returns { ok, kind } (kind null = both).
 const TYPE_MAP = { sticker: 'sticker', stickers: 'sticker', gif: 'gif', gifs: 'gif', all: null, '': null };
@@ -102,20 +121,31 @@ const listHandler = (fixed) => (req, res) => {
 
   const pl = Number.isFinite(+req.query.popular_limit) && req.query.popular_limit !== undefined && req.query.popular_limit !== ''
     ? Math.min(Math.max(Math.floor(+req.query.popular_limit), 0), 30) : 10;
-  // With a verified user: "popular" = THIS user's most used items; otherwise the global counts (read fresh, not from the cache)
+
+  // "popular" inside a list/search result:
+  //   1) with a verified user: THIS user's most used items first (source: 'user', with their own `uses`)
+  //   2) then, if there is room, the globally most used ones (source: 'global', no `uses`, so counts of other people are not exposed)
+  //   Without a user: global counts only (source: 'global', with `uses`, as before). Counts are read fresh, not from the cache.
   const uid = userIdOf(req);
-  const usesOf = uid ? userUsesMap(uid) : globalUsesMap();
-  const popularAll = data
-    .filter((d) => d.match !== 'related' && (usesOf.get(d.s.id) || 0) > 0)
-    .sort((a, b) => (usesOf.get(b.s.id) || 0) - (usesOf.get(a.s.id) || 0))
-    .slice(0, pl);
-  const popIds = new Set(popularAll.map((d) => d.s.id));
+  const mine = uid ? userUsesMap(uid) : new Map();
+  const glob = globalAllowed() ? globalUsesMap() : new Map();
+  const cand = data.filter((d) => d.match !== 'related');
+  const own = uid ? cand.filter((d) => (mine.get(d.s.id) || 0) > 0).sort((a, b) => mine.get(b.s.id) - mine.get(a.s.id)) : [];
+  const ownIds = new Set(own.map((d) => d.s.id));
+  const fallback = cand.filter((d) => !ownIds.has(d.s.id) && (glob.get(d.s.id) || 0) > 0).sort((a, b) => glob.get(b.s.id) - glob.get(a.s.id));
+  const popularAll = [
+    ...own.map((d) => ({ d, source: 'user', uses: mine.get(d.s.id) })),
+    ...fallback.map((d) => ({ d, source: 'global', uses: uid ? undefined : glob.get(d.s.id) })),
+  ].slice(0, pl);
+  const popIds = new Set(popularAll.map((p) => p.d.s.id));
   const recentAll = data.filter((d) => !popIds.has(d.s.id));
   const out = (d) => shape(d.s, d.match);
 
   res.json({
     total: data.length, matched, limit, offset,
-    ...(offset === 0 && popularAll.length > 0 && { popular: popularAll.map((d) => ({ ...out(d), uses: usesOf.get(d.s.id) })) }),
+    ...(offset === 0 && popularAll.length > 0 && {
+      popular: popularAll.map((p) => ({ ...out(p.d), source: p.source, ...(p.uses !== undefined && { uses: p.uses }) })),
+    }),
     recent: recentAll.slice(offset, offset + limit).map(out),
     recentTotal: recentAll.length,
     data: data.slice(offset, offset + limit).map(out),
@@ -142,45 +172,130 @@ const tagsHandler = (fixed) => (req, res) => {
   res.json(Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([tag, count]) => ({ tag, count })));
 };
 
-const popularHandler = (fixed) => (req, res) => {
+// GET /api/media/:id   (numeric id; ?type=sticker|gif optional)  -> one published item, same shape as in the lists.
+// Lets a chat server look the item up itself (so it never has to trust a URL sent by an app).
+const itemHandler = (fixed) => (req, res) => {
   const { ok, kind } = resolveKind(fixed, req, res);
   if (!ok) return;
-  const limit = Math.min(Math.max(Math.floor(+req.query.limit) || 12, 1), 50);
-  const uid = userIdOf(req);
-  // With a user id: only what THIS user used (most used first, then most recent). Without: global popular.
-  const rows = uid
+  const id = Number(req.params.id);
+  const s = publishedItems(kind).find((x) => x.id === id);
+  res.locals.count = s ? 1 : 0;
+  if (!s) return res.status(404).json({ error: 'Not found' });
+  res.json(shape(s, 'item'));
+};
+
+// Builds the popular list for a user (or anonymous). Used by /popular and, optionally, by /use.
+// Each item has `source`: 'user' (your own most used, with `uses`) | 'global' (everyone's most used) | 'new' (discover slot).
+// `scope`: 'user' | 'global' | 'user+global'  (describes the popular items only; 'new' items are not counted).
+const discoverParam = (req) => (req.query.discover === undefined || req.query.discover === ''
+  ? DISCOVER_SLOTS : Math.min(Math.max(Math.floor(+req.query.discover) || 0, 0), 5));
+
+const buildPopular = (kind, uid, limit, wantDiscover) => {
+  const discover = Math.min(wantDiscover, limit - 1);   // never let discover slots take over the whole list
+  const target = limit - discover;                       // slots left for real popular items
+
+  // 1) this user's own most used (most used first, then most recent)
+  const userRows = uid
     ? db.prepare(
       `SELECT s.*, p.name AS pack_name, p.kind AS kind, u.use_count AS uses FROM user_uses u
        JOIN stickers s ON s.id=u.item_id JOIN packs p ON p.id=s.pack_id
        WHERE u.user_id=? AND p.published=1 AND (? IS NULL OR p.kind=?) AND u.use_count>0
-       ORDER BY u.use_count DESC, u.last_used_at DESC, s.id DESC LIMIT ?`).all(uid, kind, kind, limit)
-    : db.prepare(
+       ORDER BY u.use_count DESC, u.last_used_at DESC, s.id DESC LIMIT ?`).all(uid, kind, kind, target)
+    : [];
+  let items = userRows.map((r) => ({ ...shape(r, 'popular'), source: 'user', uses: r.uses }));
+
+  // 2) fill the rest with global popular (no duplicates; ask for extra rows because some will be duplicates)
+  if (items.length < target && globalAllowed()) {
+    const have = new Set(items.map((i) => i.id));
+    const globalRows = db.prepare(
       `SELECT s.*, p.name AS pack_name, p.kind AS kind, s.use_count AS uses FROM stickers s JOIN packs p ON p.id=s.pack_id
        WHERE p.published=1 AND (? IS NULL OR p.kind=?) AND s.use_count>0
-       ORDER BY s.use_count DESC, s.last_used_at DESC, s.id DESC LIMIT ?`).all(kind, kind, limit);
-  res.locals.count = rows.length;
-  res.json({ total: rows.length, limit, scope: uid ? 'user' : 'global', data: rows.map((s) => ({ ...shape(s, 'popular'), uses: s.uses })) });
+       ORDER BY s.use_count DESC, s.last_used_at DESC, s.id DESC LIMIT ?`).all(kind, kind, target + items.length);
+    const extra = globalRows.filter((r) => !have.has(r.id)).slice(0, target - items.length);
+    // a logged-in user must not see other people's counts, only the ranking
+    items = items.concat(extra.map((r) => ({ ...shape(r, 'popular'), source: 'global', ...(!uid && { uses: r.uses }) })));
+  }
+
+  const popularCount = items.length;
+  const fromUser = items.some((i) => i.source === 'user');
+  const fromGlobal = items.some((i) => i.source === 'global');
+  const scope = fromUser && fromGlobal ? 'user+global' : fromGlobal ? 'global' : fromUser ? 'user' : (uid ? 'user' : 'global');
+
+  // 3) discover slots: newest published items that are not already in the list
+  if (discover > 0) {
+    const have = new Set(items.map((i) => i.id));
+    publishedItems(kind).filter((s) => !have.has(s.id)).slice(0, discover)
+      .forEach((s) => items.push({ ...shape(s, 'new'), source: 'new' }));
+  }
+  return { items, popularCount, scope };
 };
 
+// GET /api/media/popular   (also /api/stickers/popular, /api/gifs/popular)
+//   ?limit=12 (1-50)   ?discover=2 (0-5: slots for the newest never-used items; default POPULAR_DISCOVER_SLOTS)
+const popularHandler = (fixed) => (req, res) => {
+  const { ok, kind } = resolveKind(fixed, req, res);
+  if (!ok) return;
+  const limit = Math.min(Math.max(Math.floor(+req.query.limit) || 12, 1), 50);
+  const { items, popularCount, scope } = buildPopular(kind, userIdOf(req), limit, discoverParam(req));
+  res.locals.count = items.length;
+  res.json({ total: items.length, popularTotal: popularCount, limit, scope, data: items });
+};
+
+// Remembers when an item was last counted for a user/IP, so a double tap or a looping client can't inflate counts.
+const lastCounted = new Map(); // `${uidOrIp}:${itemId}` -> timestamp
+setInterval(() => {
+  const cutoff = Date.now() - Math.max(USE_COOLDOWN_MS, 1000) * 2;
+  for (const [k, t] of lastCounted) if (t < cutoff) lastCounted.delete(k);
+}, 60000).unref();
+
+// POST /api/media/:id/use     Call this every time a user SENDS a sticker/GIF (this is what feeds "popular").
+//   Optional: add ?popular_limit=10 (1-50, and ?discover=0-5 like /popular) and the response also carries the
+//   user's UPDATED popular list ({ popular, scope }), so the app does not need a second request. Off by default.
 const useHandler = (fixed) => (req, res) => {
   const { ok, kind } = resolveKind(fixed, req, res);
   if (!ok) return;
   // Reports come from your chat server (X-Usage-Key) or from an app holding a token the server signed for that user
   if (USAGE_KEY && !hasUsageKey(req) && !userIdOf(req)) return res.status(401).json({ error: 'Invalid usage key or user token' });
   if (!/^\d+$/.test(req.params.id)) return res.status(400).json({ error: 'Invalid id' });
-  const r = db.prepare(
-    `UPDATE stickers SET use_count=COALESCE(use_count,0)+1, last_used_at=CURRENT_TIMESTAMP
-     WHERE id=? AND pack_id IN (SELECT id FROM packs WHERE published=1 AND (? IS NULL OR kind=?))`).run(req.params.id, kind, kind);
-  if (!r.changes) return res.status(404).json({ error: 'Not found' });
   const uid = userIdOf(req);
-  if (uid) {
-    db.prepare(
-      `INSERT INTO user_uses (user_id, item_id, use_count, last_used_at) VALUES (?,?,1,CURRENT_TIMESTAMP)
-       ON CONFLICT(user_id, item_id) DO UPDATE SET use_count=use_count+1, last_used_at=CURRENT_TIMESTAMP`).run(uid, req.params.id);
+
+  const itemId = Number(req.params.id);
+  const popLimit = Math.min(Math.max(Math.floor(+req.query.popular_limit) || 0, 0), 50);
+  const withPopular = () => {
+    if (!popLimit) return {};
+    const { items, scope } = buildPopular(kind, uid, popLimit, discoverParam(req));
+    return { scope, popular: items };
+  };
+  const who = uid || `ip:${req.ip}`;
+  const key = `${who}:${itemId}`;
+  const now = Date.now();
+  if (USE_COOLDOWN_MS && now - (lastCounted.get(key) || 0) < USE_COOLDOWN_MS) {
+    res.locals.count = 0;
+    return res.json({ ok: true, counted: false, ...withPopular() }); // duplicate within the cooldown: accepted, but not counted again
   }
-  res.locals.count = 1;
-  res.locals.used = { id: Number(req.params.id), kind: db.prepare('SELECT p.kind FROM stickers s JOIN packs p ON p.id=s.pack_id WHERE s.id=?').get(req.params.id).kind }; // for the "Most used" analytics
-  res.json({ ok: true });
+
+  // Global counter + per-user counter change together or not at all
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const r = db.prepare(
+      `UPDATE stickers SET use_count=COALESCE(use_count,0)+1, last_used_at=CURRENT_TIMESTAMP
+       WHERE id=? AND pack_id IN (SELECT id FROM packs WHERE published=1 AND (? IS NULL OR kind=?))`).run(itemId, kind, kind);
+    if (!r.changes) { db.exec('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
+    if (uid) {
+      db.prepare(
+        `INSERT INTO user_uses (user_id, item_id, use_count, last_used_at) VALUES (?,?,1,CURRENT_TIMESTAMP)
+         ON CONFLICT(user_id, item_id) DO UPDATE SET use_count=use_count+1, last_used_at=CURRENT_TIMESTAMP`).run(uid, itemId);
+    }
+    const usedKind = db.prepare('SELECT p.kind FROM stickers s JOIN packs p ON p.id=s.pack_id WHERE s.id=?').get(itemId).kind;
+    db.exec('COMMIT');
+    lastCounted.set(key, now);
+    res.locals.count = 1;
+    res.locals.used = { id: itemId, kind: usedKind }; // for the "Most used" analytics
+    res.json({ ok: true, counted: true, ...withPopular() }); // popular is read AFTER the commit, so it already includes this use
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch { /* no open transaction */ }
+    throw e;
+  }
 };
 
-module.exports = { listHandler, packsHandler, tagsHandler, popularHandler, useHandler };
+module.exports = { listHandler, packsHandler, tagsHandler, popularHandler, useHandler, itemHandler };
